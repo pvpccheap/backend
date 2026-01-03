@@ -1,0 +1,37 @@
+# Systemd service per PVPCCheap amb Podman
+#
+# Instal·lació:
+#   sudo cp pvpccheap.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable pvpccheap
+#   sudo systemctl start pvpccheap
+#
+# O per usuari rootless:
+#   mkdir -p ~/.config/systemd/user/
+#   cp pvpccheap.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable pvpccheap
+#   systemctl --user start pvpccheap
+#   loginctl enable-linger $USER  # Per mantenir serveis actius sense login
+
+[Unit]
+Description=PVPCCheap Backend Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pvpccheap
+EnvironmentFile=/opt/pvpccheap/.env.production
+ExecStartPre=/usr/bin/podman-compose -f podman-compose.prod.yml pull
+ExecStart=/usr/bin/podman-compose -f podman-compose.prod.yml up
+ExecStop=/usr/bin/podman-compose -f podman-compose.prod.yml down
+Restart=always
+RestartSec=10
+
+# Límits de recursos (opcional)
+# MemoryMax=512M
+# CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

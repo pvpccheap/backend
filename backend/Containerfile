@@ -1,0 +1,52 @@
+# Stage 1: Build
+FROM docker.io/rust:1.92-alpine AS builder
+
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf
+
+WORKDIR /app
+
+# Copiar només els fitxers de dependències primer (per cache)
+COPY Cargo.toml Cargo.lock ./
+COPY backend/Cargo.toml backend/
+COPY shared/Cargo.toml shared/
+
+# Crear fitxers dummy per compilar dependències
+RUN mkdir -p backend/src shared/src && \
+    echo "fn main() {}" > backend/src/main.rs && \
+    echo "pub fn dummy() {}" > shared/src/lib.rs
+
+# Compilar dependències (cached)
+RUN cargo build --release --package pvpccheap-backend && \
+    rm -rf backend/src shared/src
+
+# Copiar el codi real
+COPY shared/src shared/src
+COPY backend/src backend/src
+COPY migrations migrations
+
+# Recompilar només el nostre codi
+RUN touch backend/src/main.rs shared/src/lib.rs && \
+    cargo build --release --package pvpccheap-backend
+
+# Stage 2: Runtime
+FROM docker.io/alpine:3.23
+
+RUN apk add --no-cache ca-certificates tzdata
+
+# Timezone per Espanya (important pels schedules)
+ENV TZ=Europe/Madrid
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/pvpccheap-backend /app/pvpccheap-backend
+
+# Usuari no-root
+RUN addgroup -g 1000 app && adduser -u 1000 -G app -D app
+USER app
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+
+CMD ["/app/pvpccheap-backend"]

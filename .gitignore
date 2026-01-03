@@ -1,0 +1,52 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment (secrets)
+.env
+.env.local
+.env.production
+.env.*.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+.directory
+
+# Podman/Docker
+*.tar
+podman-volume-backup/
+
+# Debug
+*.pdb
+core
+core.*
+
+# Coverage
+*.gcno
+*.gcda
+lcov.info
+tarpaulin-report.html
+
+# Backup files
+*.bak
+*.backup
+*.orig

@@ -1,0 +1,52 @@
+# Producció amb Podman
+# Executar: podman-compose -f podman-compose.prod.yml up -d
+
+services:
+  postgres:
+    image: docker.io/postgres:18-alpine
+    container_name: pvpccheap-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pvpccheap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-pvpccheap}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pvpccheap"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # No exposem el port a l'exterior en producció
+    # ports:
+    #   - "5432:5432"
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Containerfile
+    container_name: pvpccheap-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-pvpccheap}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pvpccheap}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?GOOGLE_CLIENT_ID is required}
+      ESIOS_TOKEN: ${ESIOS_TOKEN:?ESIOS_TOKEN is required}
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8080
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://pvpccheap.example.com}
+      RUST_LOG: ${RUST_LOG:-info,sqlx=warn}
+      TZ: Europe/Madrid
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  postgres_data:
