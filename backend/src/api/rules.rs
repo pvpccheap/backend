@@ -121,6 +121,7 @@ async fn list_rules(
 async fn create_rule(
     pool: web::Data<PgPool>,
     config: web::Data<Config>,
+    pvpc: web::Data<PvpcClient>,
     req: HttpRequest,
     body: web::Json<CreateRuleRequest>,
 ) -> AppResult<HttpResponse> {
@@ -173,22 +174,23 @@ async fn create_rule(
     .await?;
 
     // Generar schedules per la nova regla
-    let pvpc = req.app_data::<web::Data<PvpcClient>>().cloned();
-    if let Some(pvpc) = pvpc {
-        let db_rule = Rule {
-            id: rule.id,
-            device_id: rule.device_id,
-            name: rule.name.clone(),
-            max_hours: rule.max_hours,
-            time_window_start: rule.time_window_start,
-            time_window_end: rule.time_window_end,
-            min_continuous_hours: rule.min_continuous_hours,
-            days_of_week: rule.days_of_week,
-            is_enabled: rule.is_enabled,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-        let _ = regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule).await;
+    tracing::info!("Generant schedules per la nova regla '{}'...", rule.name);
+    let db_rule = Rule {
+        id: rule.id,
+        device_id: rule.device_id,
+        name: rule.name.clone(),
+        max_hours: rule.max_hours,
+        time_window_start: rule.time_window_start,
+        time_window_end: rule.time_window_end,
+        min_continuous_hours: rule.min_continuous_hours,
+        days_of_week: rule.days_of_week,
+        is_enabled: rule.is_enabled,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    match regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule).await {
+        Ok(count) => tracing::info!("Creats {} schedules per la nova regla '{}'", count, rule.name),
+        Err(e) => tracing::error!("Error generant schedules per la nova regla '{}': {}", rule.name, e),
     }
 
     Ok(HttpResponse::Created().json(RuleResponse::from(rule)))
@@ -229,6 +231,7 @@ async fn get_rule(
 async fn update_rule(
     pool: web::Data<PgPool>,
     config: web::Data<Config>,
+    pvpc: web::Data<PvpcClient>,
     req: HttpRequest,
     path: web::Path<Uuid>,
     body: web::Json<UpdateRuleRequest>,
@@ -290,29 +293,31 @@ async fn update_rule(
     .await?;
 
     // Regenerar schedules si la regla ha canviat
-    let pvpc = req.app_data::<web::Data<PvpcClient>>().cloned();
-    if let Some(pvpc) = pvpc {
-        let db_rule = Rule {
-            id: updated.id,
-            device_id: updated.device_id,
-            name: updated.name.clone(),
-            max_hours: updated.max_hours,
-            time_window_start: updated.time_window_start,
-            time_window_end: updated.time_window_end,
-            min_continuous_hours: updated.min_continuous_hours,
-            days_of_week: updated.days_of_week,
-            is_enabled: updated.is_enabled,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
+    let db_rule = Rule {
+        id: updated.id,
+        device_id: updated.device_id,
+        name: updated.name.clone(),
+        max_hours: updated.max_hours,
+        time_window_start: updated.time_window_start,
+        time_window_end: updated.time_window_end,
+        min_continuous_hours: updated.min_continuous_hours,
+        days_of_week: updated.days_of_week,
+        is_enabled: updated.is_enabled,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
 
-        if updated.is_enabled {
-            // Si està habilitada, regenerar schedules
-            let _ = regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule).await;
-        } else {
-            // Si s'ha desactivat, cancel·lar schedules pendents
-            let _ = cancel_pending_schedules_for_rule(pool.get_ref(), rule_id).await;
+    if updated.is_enabled {
+        // Si està habilitada, regenerar schedules
+        tracing::info!("Regenerant schedules per la regla '{}'...", updated.name);
+        match regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule).await {
+            Ok(count) => tracing::info!("Regenerats {} schedules per la regla '{}'", count, updated.name),
+            Err(e) => tracing::error!("Error regenerant schedules per la regla '{}': {}", updated.name, e),
         }
+    } else {
+        // Si s'ha desactivat, cancel·lar schedules pendents
+        tracing::info!("Cancel·lant schedules per la regla desactivada '{}'...", updated.name);
+        let _ = cancel_pending_schedules_for_rule(pool.get_ref(), rule_id).await;
     }
 
     Ok(HttpResponse::Ok().json(RuleResponse::from(updated)))
