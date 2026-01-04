@@ -1,12 +1,14 @@
 use actix_web::{delete, get, post, put, web, HttpRequest, HttpResponse};
-use chrono::NaiveTime;
+use chrono::{Datelike, Local, NaiveTime};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::db::models::Device;
+use crate::db::models::{Device, Rule};
 use crate::error::{AppError, AppResult};
+use crate::services::pvpc::PvpcClient;
+use crate::services::scheduler::calculate_optimal_hours;
 
 use super::auth::extract_user_from_request;
 
@@ -170,6 +172,25 @@ async fn create_rule(
     .fetch_one(pool.get_ref())
     .await?;
 
+    // Generar schedules per la nova regla
+    let pvpc = req.app_data::<web::Data<PvpcClient>>().cloned();
+    if let Some(pvpc) = pvpc {
+        let db_rule = Rule {
+            id: rule.id,
+            device_id: rule.device_id,
+            name: rule.name.clone(),
+            max_hours: rule.max_hours,
+            time_window_start: rule.time_window_start,
+            time_window_end: rule.time_window_end,
+            min_continuous_hours: rule.min_continuous_hours,
+            days_of_week: rule.days_of_week,
+            is_enabled: rule.is_enabled,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let _ = regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule).await;
+    }
+
     Ok(HttpResponse::Created().json(RuleResponse::from(rule)))
 }
 
@@ -268,6 +289,32 @@ async fn update_rule(
     .fetch_one(pool.get_ref())
     .await?;
 
+    // Regenerar schedules si la regla ha canviat
+    let pvpc = req.app_data::<web::Data<PvpcClient>>().cloned();
+    if let Some(pvpc) = pvpc {
+        let db_rule = Rule {
+            id: updated.id,
+            device_id: updated.device_id,
+            name: updated.name.clone(),
+            max_hours: updated.max_hours,
+            time_window_start: updated.time_window_start,
+            time_window_end: updated.time_window_end,
+            min_continuous_hours: updated.min_continuous_hours,
+            days_of_week: updated.days_of_week,
+            is_enabled: updated.is_enabled,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        if updated.is_enabled {
+            // Si està habilitada, regenerar schedules
+            let _ = regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule).await;
+        } else {
+            // Si s'ha desactivat, cancel·lar schedules pendents
+            let _ = cancel_pending_schedules_for_rule(pool.get_ref(), rule_id).await;
+        }
+    }
+
     Ok(HttpResponse::Ok().json(RuleResponse::from(updated)))
 }
 
@@ -301,4 +348,162 @@ async fn delete_rule(
     }
 
     Ok(HttpResponse::NoContent().finish())
+}
+
+/// Regenera els schedules per una regla (avui i demà si els preus estan disponibles)
+async fn regenerate_schedules_for_rule(
+    pool: &PgPool,
+    pvpc: &PvpcClient,
+    rule: &Rule,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let now = Local::now();
+    let today = now.date_naive();
+    let tomorrow = today + chrono::Duration::days(1);
+    let current_time = now.time();
+
+    // Primer, eliminar schedules pendents d'aquesta regla (que encara no han passat)
+    sqlx::query(
+        r#"
+        DELETE FROM scheduled_actions
+        WHERE rule_id = $1
+          AND status = 'pending'
+          AND (scheduled_date > $2 OR (scheduled_date = $2 AND start_time > $3))
+        "#
+    )
+    .bind(rule.id)
+    .bind(today)
+    .bind(current_time)
+    .execute(pool)
+    .await?;
+
+    let mut created_count = 0;
+
+    // Generar per avui (només hores futures)
+    if let Ok(prices) = pvpc.get_today_prices().await {
+        created_count += generate_schedules_for_rule_and_date(pool, rule, &prices, today, Some(current_time)).await?;
+    }
+
+    // Generar per demà (si els preus estan disponibles)
+    if let Ok(prices) = pvpc.get_tomorrow_prices().await {
+        if !prices.prices.is_empty() {
+            created_count += generate_schedules_for_rule_and_date(pool, rule, &prices, tomorrow, None).await?;
+        }
+    }
+
+    tracing::info!(
+        "Regenerats {} schedules per la regla '{}' (id: {})",
+        created_count,
+        rule.name,
+        rule.id
+    );
+
+    Ok(created_count)
+}
+
+/// Genera schedules per una regla i una data específica
+async fn generate_schedules_for_rule_and_date(
+    pool: &PgPool,
+    rule: &Rule,
+    prices: &shared::DailyPrices,
+    date: chrono::NaiveDate,
+    min_time: Option<NaiveTime>,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    // Comprovar si el dia de la setmana està inclòs
+    let weekday = date.weekday();
+    let day_bit = match weekday {
+        chrono::Weekday::Mon => 1,
+        chrono::Weekday::Tue => 2,
+        chrono::Weekday::Wed => 4,
+        chrono::Weekday::Thu => 8,
+        chrono::Weekday::Fri => 16,
+        chrono::Weekday::Sat => 32,
+        chrono::Weekday::Sun => 64,
+    };
+
+    if (rule.days_of_week & day_bit) == 0 {
+        return Ok(0);
+    }
+
+    // Calcular les hores òptimes
+    let optimal = calculate_optimal_hours(
+        &prices.prices,
+        rule.max_hours,
+        rule.min_continuous_hours,
+        rule.time_window_start,
+        rule.time_window_end,
+    );
+
+    let mut created_count = 0;
+
+    for hour in &optimal.hours {
+        let start_time = NaiveTime::from_hms_opt(*hour as u32, 0, 0).unwrap();
+
+        // Si hi ha min_time, saltar hores que ja han passat
+        if let Some(min) = min_time {
+            if start_time <= min {
+                continue;
+            }
+        }
+
+        let end_time = NaiveTime::from_hms_opt((*hour as u32 + 1) % 24, 0, 0).unwrap();
+        let price = prices.prices.iter()
+            .find(|p| p.hour == *hour)
+            .map(|p| p.price);
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO scheduled_actions (rule_id, scheduled_date, start_time, end_time, price_per_kwh, status)
+            VALUES ($1, $2, $3, $4, $5, 'pending')
+            ON CONFLICT (rule_id, scheduled_date, start_time) DO NOTHING
+            "#
+        )
+        .bind(rule.id)
+        .bind(date)
+        .bind(start_time)
+        .bind(end_time)
+        .bind(price)
+        .execute(pool)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            created_count += 1;
+        }
+    }
+
+    Ok(created_count)
+}
+
+/// Cancel·la els schedules pendents d'una regla (quan es desactiva)
+async fn cancel_pending_schedules_for_rule(
+    pool: &PgPool,
+    rule_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let now = Local::now();
+    let today = now.date_naive();
+    let current_time = now.time();
+
+    let result = sqlx::query(
+        r#"
+        UPDATE scheduled_actions
+        SET status = 'cancelled'
+        WHERE rule_id = $1
+          AND status = 'pending'
+          AND (scheduled_date > $2 OR (scheduled_date = $2 AND start_time > $3))
+        "#
+    )
+    .bind(rule_id)
+    .bind(today)
+    .bind(current_time)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() > 0 {
+        tracing::info!(
+            "Cancel·lats {} schedules pendents per la regla {}",
+            result.rows_affected(),
+            rule_id
+        );
+    }
+
+    Ok(result.rows_affected())
 }
