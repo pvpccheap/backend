@@ -22,13 +22,20 @@ const CHECK_INTERVAL_SECONDS: u64 = 60;
 pub fn start_background_tasks(pool: Arc<PgPool>, pvpc_client: Arc<PvpcClient>) {
     let pool_clone = pool.clone();
     let pvpc_clone = pvpc_client.clone();
+    let pool_for_cleanup = pool.clone();
 
+    // Tasca 1: Generació de schedules
     tokio::spawn(async move {
         // Primer, comprovar si falten schedules d'avui
         check_and_generate_today_schedules(&pool_clone, &pvpc_clone).await;
 
         // Després, iniciar el scheduler diari
         run_daily_scheduler(pool_clone, pvpc_clone).await;
+    });
+
+    // Tasca 2: Marcar accions pendents expirades com a 'missed'
+    tokio::spawn(async move {
+        run_expired_actions_checker(pool_for_cleanup).await;
     });
 }
 
@@ -276,4 +283,70 @@ async fn generate_schedule_with_prices(
     );
 
     Ok(created_count)
+}
+
+/// Comprova cada minut si hi ha accions pendents que ja han expirat i les marca com 'missed'
+async fn run_expired_actions_checker(pool: Arc<PgPool>) {
+    let mut check_interval = interval(Duration::from_secs(CHECK_INTERVAL_SECONDS));
+
+    loop {
+        check_interval.tick().await;
+
+        if let Err(e) = mark_expired_actions_as_missed(&pool).await {
+            tracing::error!("Error marcant accions expirades: {}", e);
+        }
+    }
+}
+
+/// Marca les accions pendents que ja han passat la seva hora end_time com a 'missed'
+async fn mark_expired_actions_as_missed(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let now = Local::now();
+    let today = now.date_naive();
+    let current_time = now.time();
+
+    // Marcar com 'missed' les accions d'avui que ja han passat
+    let result = sqlx::query(
+        r#"
+        UPDATE scheduled_actions
+        SET status = 'missed'
+        WHERE status = 'pending'
+          AND scheduled_date = $1
+          AND end_time <= $2
+        "#
+    )
+    .bind(today)
+    .bind(current_time)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() > 0 {
+        tracing::info!(
+            "Marcades {} accions com a 'missed' (data: {}, hora actual: {})",
+            result.rows_affected(),
+            today,
+            current_time.format("%H:%M")
+        );
+    }
+
+    // També marcar les accions de dies anteriors que encara estiguin pendents
+    let result_old = sqlx::query(
+        r#"
+        UPDATE scheduled_actions
+        SET status = 'missed'
+        WHERE status = 'pending'
+          AND scheduled_date < $1
+        "#
+    )
+    .bind(today)
+    .execute(pool)
+    .await?;
+
+    if result_old.rows_affected() > 0 {
+        tracing::info!(
+            "Marcades {} accions antigues com a 'missed'",
+            result_old.rows_affected()
+        );
+    }
+
+    Ok(())
 }
