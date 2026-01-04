@@ -75,8 +75,12 @@ async fn main() -> std::io::Result<()> {
             .max_age(3600);
 
         // Configurar orígens permesos
-        for origin in &config.allowed_origins {
-            cors = cors.allowed_origin(origin);
+        if config.allowed_origins.iter().any(|o| o == "*") {
+            cors = cors.allow_any_origin().send_wildcard();
+        } else {
+            for origin in &config.allowed_origins {
+                cors = cors.allowed_origin(origin);
+            }
         }
 
         App::new()
