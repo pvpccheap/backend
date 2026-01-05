@@ -384,14 +384,39 @@ async fn regenerate_schedules_for_rule(
     let mut created_count = 0;
 
     // Generar per avui (només hores futures)
-    if let Ok(prices) = pvpc.get_today_prices().await {
-        created_count += generate_schedules_for_rule_and_date(pool, rule, &prices, today, Some(current_time)).await?;
+    match pvpc.get_today_prices().await {
+        Ok(prices) => {
+            tracing::info!(
+                "Preus d'avui ({}) obtinguts: {} hores",
+                today,
+                prices.prices.len()
+            );
+            let count = generate_schedules_for_rule_and_date(pool, rule, &prices, today, Some(current_time)).await?;
+            tracing::info!(
+                "Generats {} schedules per avui (hores futures després de {})",
+                count,
+                current_time.format("%H:%M")
+            );
+            created_count += count;
+        }
+        Err(e) => {
+            tracing::warn!("No s'han pogut obtenir els preus d'avui: {:?}", e);
+        }
     }
 
     // Generar per demà (si els preus estan disponibles)
-    if let Ok(prices) = pvpc.get_tomorrow_prices().await {
-        if !prices.prices.is_empty() {
-            created_count += generate_schedules_for_rule_and_date(pool, rule, &prices, tomorrow, None).await?;
+    match pvpc.get_tomorrow_prices().await {
+        Ok(prices) => {
+            if !prices.prices.is_empty() {
+                let count = generate_schedules_for_rule_and_date(pool, rule, &prices, tomorrow, None).await?;
+                tracing::info!("Generats {} schedules per demà ({})", count, tomorrow);
+                created_count += count;
+            } else {
+                tracing::info!("Preus de demà ({}) encara no disponibles", tomorrow);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("No s'han pogut obtenir els preus de demà: {:?}", e);
         }
     }
 
