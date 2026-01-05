@@ -26,6 +26,7 @@ pub struct SyncDeviceItem {
 pub struct UpdateDeviceRequest {
     pub is_active: Option<bool>,
     pub name: Option<String>,
+    pub google_device_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,17 +145,19 @@ async fn update_device(
     // Actualitzar només els camps proporcionats
     let new_name = body.name.as_ref().unwrap_or(&existing.name);
     let new_is_active = body.is_active.unwrap_or(existing.is_active);
+    let new_google_device_id = body.google_device_id.as_ref().unwrap_or(&existing.google_device_id);
 
     let updated = sqlx::query_as::<_, Device>(
         r#"
         UPDATE devices
-        SET name = $1, is_active = $2
-        WHERE id = $3
+        SET name = $1, is_active = $2, google_device_id = $3
+        WHERE id = $4
         RETURNING *
         "#
     )
     .bind(new_name)
     .bind(new_is_active)
+    .bind(new_google_device_id)
     .bind(device_id)
     .fetch_one(pool.get_ref())
     .await?;
