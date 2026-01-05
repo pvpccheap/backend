@@ -248,7 +248,13 @@ async fn generate_schedule_with_prices(
         // Crear scheduled_actions per cada hora
         for hour in &optimal.hours {
             let start_time = NaiveTime::from_hms_opt(*hour as u32, 0, 0).unwrap();
-            let end_time = NaiveTime::from_hms_opt((*hour as u32 + 1) % 24, 0, 0).unwrap();
+            // Per l'hora 23, end_time seria 00:00 que causa problemes de comparació
+            // Usem 23:59:59 per evitar que end_time < start_time
+            let end_time = if *hour == 23 {
+                NaiveTime::from_hms_opt(23, 59, 59).unwrap()
+            } else {
+                NaiveTime::from_hms_opt(*hour as u32 + 1, 0, 0).unwrap()
+            };
 
             let price = prices.prices.iter()
                 .find(|p| p.hour == *hour)
@@ -305,12 +311,16 @@ async fn mark_expired_actions_as_missed(pool: &PgPool) -> Result<(), sqlx::Error
     let current_time = now.time();
 
     // Marcar com 'missed' les accions d'avui que ja han passat
+    // Cas 1: Accions normals (end_time > start_time) - ja han acabat
+    // Cas 2: Accions que creuen mitjanit (end_time <= start_time, ex: 23:00-00:00)
+    //        Aquestes NO s'han de marcar com missed fins que passi la mitjanit del dia següent
     let result = sqlx::query(
         r#"
         UPDATE scheduled_actions
         SET status = 'missed'
         WHERE status = 'pending'
           AND scheduled_date = $1
+          AND end_time > start_time
           AND end_time <= $2
         "#
     )
@@ -328,7 +338,8 @@ async fn mark_expired_actions_as_missed(pool: &PgPool) -> Result<(), sqlx::Error
         );
     }
 
-    // També marcar les accions de dies anteriors que encara estiguin pendents
+    // Marcar les accions de dies anteriors que encara estiguin pendents
+    // Inclou accions que creuaven mitjanit del dia anterior
     let result_old = sqlx::query(
         r#"
         UPDATE scheduled_actions

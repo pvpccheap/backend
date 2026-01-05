@@ -450,7 +450,13 @@ async fn generate_schedules_for_rule_and_date(
             }
         }
 
-        let end_time = NaiveTime::from_hms_opt((*hour as u32 + 1) % 24, 0, 0).unwrap();
+        // Per l'hora 23, end_time seria 00:00 que causa problemes de comparació
+        // Usem 23:59:59 per evitar que end_time < start_time
+        let end_time = if *hour == 23 {
+            NaiveTime::from_hms_opt(23, 59, 59).unwrap()
+        } else {
+            NaiveTime::from_hms_opt(*hour as u32 + 1, 0, 0).unwrap()
+        };
         let price = prices.prices.iter()
             .find(|p| p.hour == *hour)
             .map(|p| p.price);
