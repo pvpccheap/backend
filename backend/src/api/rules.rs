@@ -61,6 +61,14 @@ pub struct RuleResponse {
     pub min_continuous_hours: i32,
     pub days_of_week: i32,
     pub is_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_info: Option<ScheduleGenerationInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScheduleGenerationInfo {
+    pub schedules_created: usize,
+    pub message: String,
 }
 
 impl From<RuleWithDevice> for RuleResponse {
@@ -76,6 +84,7 @@ impl From<RuleWithDevice> for RuleResponse {
             min_continuous_hours: r.min_continuous_hours,
             days_of_week: r.days_of_week,
             is_enabled: r.is_enabled,
+            schedule_info: None,
         }
     }
 }
@@ -188,12 +197,22 @@ async fn create_rule(
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
-    match regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule).await {
-        Ok(count) => tracing::info!("Creats {} schedules per la nova regla '{}'", count, rule.name),
-        Err(e) => tracing::error!("Error generant schedules per la nova regla '{}': {}", rule.name, e),
-    }
 
-    Ok(HttpResponse::Created().json(RuleResponse::from(rule)))
+    let schedule_info = match regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule).await {
+        Ok(info) => {
+            tracing::info!("Creats {} schedules per la nova regla '{}': {}", info.schedules_created, rule.name, info.message);
+            Some(info)
+        }
+        Err(e) => {
+            tracing::error!("Error generant schedules per la nova regla '{}': {}", rule.name, e);
+            None
+        }
+    };
+
+    let mut response = RuleResponse::from(rule);
+    response.schedule_info = schedule_info;
+
+    Ok(HttpResponse::Created().json(response))
 }
 
 /// GET /api/rules/{id}
@@ -307,20 +326,33 @@ async fn update_rule(
         updated_at: chrono::Utc::now(),
     };
 
-    if updated.is_enabled {
+    let schedule_info = if updated.is_enabled {
         // Si està habilitada, regenerar schedules
         tracing::info!("Regenerant schedules per la regla '{}'...", updated.name);
         match regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule).await {
-            Ok(count) => tracing::info!("Regenerats {} schedules per la regla '{}'", count, updated.name),
-            Err(e) => tracing::error!("Error regenerant schedules per la regla '{}': {}", updated.name, e),
+            Ok(info) => {
+                tracing::info!("Regenerats {} schedules per la regla '{}': {}", info.schedules_created, updated.name, info.message);
+                Some(info)
+            }
+            Err(e) => {
+                tracing::error!("Error regenerant schedules per la regla '{}': {}", updated.name, e);
+                None
+            }
         }
     } else {
         // Si s'ha desactivat, cancel·lar schedules pendents
         tracing::info!("Cancel·lant schedules per la regla desactivada '{}'...", updated.name);
-        let _ = cancel_pending_schedules_for_rule(pool.get_ref(), rule_id).await;
-    }
+        let cancelled = cancel_pending_schedules_for_rule(pool.get_ref(), rule_id).await.unwrap_or(0);
+        Some(ScheduleGenerationInfo {
+            schedules_created: 0,
+            message: format!("Regla desactivada. {} schedules pendents cancel·lats.", cancelled),
+        })
+    };
 
-    Ok(HttpResponse::Ok().json(RuleResponse::from(updated)))
+    let mut response = RuleResponse::from(updated);
+    response.schedule_info = schedule_info;
+
+    Ok(HttpResponse::Ok().json(response))
 }
 
 /// DELETE /api/rules/{id}
@@ -356,11 +388,12 @@ async fn delete_rule(
 }
 
 /// Regenera els schedules per una regla (avui i demà si els preus estan disponibles)
+/// Retorna informació sobre els schedules generats
 async fn regenerate_schedules_for_rule(
     pool: &PgPool,
     pvpc: &PvpcClient,
     rule: &Rule,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ScheduleGenerationInfo, Box<dyn std::error::Error + Send + Sync>> {
     let now = Local::now();
     let today = now.date_naive();
     let tomorrow = today + chrono::Duration::days(1);
@@ -382,10 +415,15 @@ async fn regenerate_schedules_for_rule(
     .await?;
 
     let mut created_count = 0;
+    let mut today_count = 0;
+    let mut tomorrow_count = 0;
+    let mut today_available = false;
+    let mut tomorrow_available = false;
 
     // Generar per avui (només hores futures)
     match pvpc.get_today_prices().await {
         Ok(prices) => {
+            today_available = !prices.prices.is_empty();
             tracing::info!(
                 "Preus d'avui ({}) obtinguts: {} hores",
                 today,
@@ -397,6 +435,7 @@ async fn regenerate_schedules_for_rule(
                 count,
                 current_time.format("%H:%M")
             );
+            today_count = count;
             created_count += count;
         }
         Err(e) => {
@@ -407,9 +446,11 @@ async fn regenerate_schedules_for_rule(
     // Generar per demà (si els preus estan disponibles)
     match pvpc.get_tomorrow_prices().await {
         Ok(prices) => {
-            if !prices.prices.is_empty() {
+            tomorrow_available = !prices.prices.is_empty();
+            if tomorrow_available {
                 let count = generate_schedules_for_rule_and_date(pool, rule, &prices, tomorrow, None).await?;
                 tracing::info!("Generats {} schedules per demà ({})", count, tomorrow);
+                tomorrow_count = count;
                 created_count += count;
             } else {
                 tracing::info!("Preus de demà ({}) encara no disponibles", tomorrow);
@@ -427,7 +468,24 @@ async fn regenerate_schedules_for_rule(
         rule.id
     );
 
-    Ok(created_count)
+    // Generar missatge informatiu
+    let message = if created_count > 0 {
+        format!(
+            "Creats {} schedules ({} per avui, {} per demà)",
+            created_count, today_count, tomorrow_count
+        )
+    } else if today_available && !tomorrow_available {
+        "Les hores òptimes d'avui ja han passat. Els schedules de demà es generaran a les 20:30 quan els preus estiguin disponibles.".to_string()
+    } else if !today_available && !tomorrow_available {
+        "Els preus encara no estan disponibles. Els schedules es generaran automàticament quan els preus estiguin disponibles.".to_string()
+    } else {
+        "No s'han pogut generar schedules per aquesta regla avui.".to_string()
+    };
+
+    Ok(ScheduleGenerationInfo {
+        schedules_created: created_count,
+        message,
+    })
 }
 
 /// Genera schedules per una regla i una data específica
