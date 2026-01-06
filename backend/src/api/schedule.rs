@@ -20,7 +20,8 @@ pub struct CalculateRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateStatusRequest {
-    pub status: String, // "executed", "failed", "cancelled"
+    /// Status de l'acció: pending, executed, executed_on, executed_off, failed, cancelled, missed
+    pub status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -326,7 +327,22 @@ async fn update_schedule_status(
     let schedule_id = path.into_inner();
 
     // Validar que l'status és vàlid
-    let valid_statuses = ["executed", "failed", "cancelled", "pending"];
+    // - pending: acció programada pendent d'executar
+    // - executed: executat genèric (legacy)
+    // - executed_on: dispositiu encès correctament
+    // - executed_off: dispositiu apagat correctament
+    // - failed: error en l'execució
+    // - cancelled: cancel·lat manualment
+    // - missed: l'hora va passar sense executar-se
+    let valid_statuses = [
+        "pending",
+        "executed",
+        "executed_on",
+        "executed_off",
+        "failed",
+        "cancelled",
+        "missed",
+    ];
     if !valid_statuses.contains(&body.status.as_str()) {
         return Err(AppError::BadRequest(format!(
             "Invalid status '{}'. Valid values: {:?}",
@@ -335,10 +351,12 @@ async fn update_schedule_status(
     }
 
     // Verificar que l'acció pertany a l'usuari
+    // Actualitzar executed_at per qualsevol estat d'execució (executed, executed_on, executed_off)
+    let is_executed = body.status.starts_with("executed");
     let result = sqlx::query(
         r#"
         UPDATE scheduled_actions sa
-        SET status = $1, executed_at = CASE WHEN $1 = 'executed' THEN NOW() ELSE executed_at END
+        SET status = $1, executed_at = CASE WHEN $4 THEN NOW() ELSE executed_at END
         FROM rules r
         JOIN devices d ON r.device_id = d.id
         WHERE sa.id = $2 AND sa.rule_id = r.id AND d.user_id = $3
@@ -347,6 +365,7 @@ async fn update_schedule_status(
     .bind(&body.status)
     .bind(schedule_id)
     .bind(user.id)
+    .bind(is_executed)
     .execute(pool.get_ref())
     .await?;
 
