@@ -80,13 +80,15 @@ async fn google_login(
 }
 
 /// POST /api/auth/refresh
+/// Permet refresh de tokens expirats fins a 7 dies després de l'expiració
 #[post("/auth/refresh")]
 async fn refresh_token(
     pool: web::Data<PgPool>,
     config: web::Data<Config>,
     req: HttpRequest,
 ) -> AppResult<HttpResponse> {
-    let user = extract_user_from_request(&req, &pool, &config.jwt_secret).await?;
+    // Utilitzar validació especial per refresh que permet tokens expirats
+    let user = extract_user_for_refresh(&req, &pool, &config.jwt_secret).await?;
 
     let (token, expires_in) = generate_jwt(&user, &config.jwt_secret)?;
 
@@ -217,6 +219,60 @@ pub async fn extract_user_from_request(
         &DecodingKey::from_secret(jwt_secret.as_bytes()),
         &validation,
     )?;
+
+    let user_id: Uuid = token_data
+        .claims
+        .sub
+        .parse()
+        .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
+
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("User not found".to_string()))?;
+
+    Ok(user)
+}
+
+/// Extreu l'usuari d'un token per refresh, permetent tokens expirats fins a 7 dies
+/// Això és segur perquè:
+/// 1. La signatura del token encara es valida
+/// 2. L'usuari ha d'existir a la base de dades
+/// 3. Hi ha un límit de temps màxim (7 dies) per evitar refresh de tokens molt antics
+async fn extract_user_for_refresh(
+    req: &HttpRequest,
+    pool: &PgPool,
+    jwt_secret: &str,
+) -> AppResult<User> {
+    let auth_header = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AppError::Unauthorized("Missing Authorization header".to_string()))?;
+
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| AppError::Unauthorized("Invalid Authorization format".to_string()))?;
+
+    // Validació sense expiració per permetre refresh de tokens expirats
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = false; // No validar expiració
+
+    let token_data = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(jwt_secret.as_bytes()),
+        &validation,
+    )?;
+
+    // Verificar que el token no és massa antic (màxim 7 dies després d'expirar)
+    let now = Utc::now().timestamp();
+    let max_refresh_window = 7 * 24 * 3600; // 7 dies en segons
+    if now - token_data.claims.exp > max_refresh_window {
+        return Err(AppError::Unauthorized(
+            "Token expired too long ago. Please login again.".to_string(),
+        ));
+    }
 
     let user_id: Uuid = token_data
         .claims
