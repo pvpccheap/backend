@@ -198,7 +198,9 @@ async fn create_rule(
         updated_at: chrono::Utc::now(),
     };
 
-    let schedule_info = match regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule).await {
+    // include_past_hours = true: quan es crea una regla, generar schedules per totes les hores
+    // del dia (incloses les passades) per tenir l'historial complet
+    let schedule_info = match regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule, true).await {
         Ok(info) => {
             tracing::info!("Creats {} schedules per la nova regla '{}': {}", info.schedules_created, rule.name, info.message);
             Some(info)
@@ -328,8 +330,9 @@ async fn update_rule(
 
     let schedule_info = if updated.is_enabled {
         // Si està habilitada, regenerar schedules
+        // include_past_hours = false: en actualitzar, només generem hores futures
         tracing::info!("Regenerant schedules per la regla '{}'...", updated.name);
-        match regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule).await {
+        match regenerate_schedules_for_rule(pool.get_ref(), &pvpc, &db_rule, false).await {
             Ok(info) => {
                 tracing::info!("Regenerats {} schedules per la regla '{}': {}", info.schedules_created, updated.name, info.message);
                 Some(info)
@@ -389,10 +392,14 @@ async fn delete_rule(
 
 /// Regenera els schedules per una regla (avui i demà si els preus estan disponibles)
 /// Retorna informació sobre els schedules generats
+///
+/// - `include_past_hours`: si és true, genera schedules per totes les hores del dia (incloses les passades).
+///   Útil quan es crea una nova regla per tenir l'historial complet del dia.
 async fn regenerate_schedules_for_rule(
     pool: &PgPool,
     pvpc: &PvpcClient,
     rule: &Rule,
+    include_past_hours: bool,
 ) -> Result<ScheduleGenerationInfo, Box<dyn std::error::Error + Send + Sync>> {
     let now = Local::now();
     let today = now.date_naive();
@@ -400,19 +407,35 @@ async fn regenerate_schedules_for_rule(
     let current_time = now.time();
 
     // Primer, eliminar schedules pendents d'aquesta regla (que encara no han passat)
-    sqlx::query(
-        r#"
-        DELETE FROM scheduled_actions
-        WHERE rule_id = $1
-          AND status = 'pending'
-          AND (scheduled_date > $2 OR (scheduled_date = $2 AND start_time > $3))
-        "#
-    )
-    .bind(rule.id)
-    .bind(today)
-    .bind(current_time)
-    .execute(pool)
-    .await?;
+    // Si include_past_hours, eliminem tots els schedules pendents d'avui i demà
+    if include_past_hours {
+        sqlx::query(
+            r#"
+            DELETE FROM scheduled_actions
+            WHERE rule_id = $1
+              AND status = 'pending'
+              AND scheduled_date >= $2
+            "#
+        )
+        .bind(rule.id)
+        .bind(today)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            r#"
+            DELETE FROM scheduled_actions
+            WHERE rule_id = $1
+              AND status = 'pending'
+              AND (scheduled_date > $2 OR (scheduled_date = $2 AND start_time > $3))
+            "#
+        )
+        .bind(rule.id)
+        .bind(today)
+        .bind(current_time)
+        .execute(pool)
+        .await?;
+    }
 
     let mut created_count = 0;
     let mut today_count = 0;
@@ -420,7 +443,10 @@ async fn regenerate_schedules_for_rule(
     let mut today_available = false;
     let mut tomorrow_available = false;
 
-    // Generar per avui (només hores futures)
+    // El filtre de temps: None = totes les hores, Some(time) = només hores futures
+    let time_filter = if include_past_hours { None } else { Some(current_time) };
+
+    // Generar per avui
     match pvpc.get_today_prices().await {
         Ok(prices) => {
             today_available = !prices.prices.is_empty();
@@ -429,12 +455,19 @@ async fn regenerate_schedules_for_rule(
                 today,
                 prices.prices.len()
             );
-            let count = generate_schedules_for_rule_and_date(pool, rule, &prices, today, Some(current_time)).await?;
-            tracing::info!(
-                "Generats {} schedules per avui (hores futures després de {})",
-                count,
-                current_time.format("%H:%M")
-            );
+            let count = generate_schedules_for_rule_and_date(pool, rule, &prices, today, time_filter).await?;
+            if include_past_hours {
+                tracing::info!(
+                    "Generats {} schedules per avui (totes les hores del dia)",
+                    count
+                );
+            } else {
+                tracing::info!(
+                    "Generats {} schedules per avui (hores futures després de {})",
+                    count,
+                    current_time.format("%H:%M")
+                );
+            }
             today_count = count;
             created_count += count;
         }
