@@ -248,13 +248,10 @@ async fn generate_schedule_with_prices(
         // Crear scheduled_actions per cada hora
         for hour in &optimal.hours {
             let start_time = NaiveTime::from_hms_opt(*hour as u32, 0, 0).unwrap();
-            // Per l'hora 23, end_time seria 00:00 que causa problemes de comparació
-            // Usem 23:59:59 per evitar que end_time < start_time
-            let end_time = if *hour == 23 {
-                NaiveTime::from_hms_opt(23, 59, 59).unwrap()
-            } else {
-                NaiveTime::from_hms_opt(*hour as u32 + 1, 0, 0).unwrap()
-            };
+            // end_time és sempre l'hora següent (00:00 per l'hora 23)
+            // Quan start_time > end_time, significa que l'acció creua mitjanit
+            // L'Android i el backend han de tractar aquest cas especialment
+            let end_time = NaiveTime::from_hms_opt(((*hour + 1) % 24) as u32, 0, 0).unwrap();
 
             let price = prices.prices.iter()
                 .find(|p| p.hour == *hour)
@@ -305,15 +302,20 @@ async fn run_expired_actions_checker(pool: Arc<PgPool>) {
 }
 
 /// Marca les accions pendents que ja han passat la seva hora end_time com a 'missed'
+///
+/// Lògica:
+/// - Accions normals (ex: 10:00-14:00, start < end): es marquen com missed quan current_time >= end_time
+/// - Accions que creuen mitjanit (ex: 23:00-00:00, start > end): NO es marquen com missed el mateix dia,
+///   sinó quan el dia següent arriba (scheduled_date < today)
+///
+/// Això és consistent amb la lògica de l'app Android (ScheduleExecutionWorker.markMissedActionsAsFailed)
 async fn mark_expired_actions_as_missed(pool: &PgPool) -> Result<(), sqlx::Error> {
     let now = Local::now();
     let today = now.date_naive();
     let current_time = now.time();
 
-    // Marcar com 'missed' les accions d'avui que ja han passat
-    // Cas 1: Accions normals (end_time > start_time) - ja han acabat
-    // Cas 2: Accions que creuen mitjanit (end_time <= start_time, ex: 23:00-00:00)
-    //        Aquestes NO s'han de marcar com missed fins que passi la mitjanit del dia següent
+    // Cas 1: Accions normals d'avui (end_time > start_time) que ja han acabat
+    // Ex: 10:00-14:00 i ara són les 15:00 → missed
     let result = sqlx::query(
         r#"
         UPDATE scheduled_actions
@@ -331,15 +333,16 @@ async fn mark_expired_actions_as_missed(pool: &PgPool) -> Result<(), sqlx::Error
 
     if result.rows_affected() > 0 {
         tracing::info!(
-            "Marcades {} accions com a 'missed' (data: {}, hora actual: {})",
+            "Marcades {} accions normals com a 'missed' (data: {}, hora actual: {})",
             result.rows_affected(),
             today,
             current_time.format("%H:%M")
         );
     }
 
-    // Marcar les accions de dies anteriors que encara estiguin pendents
-    // Inclou accions que creuaven mitjanit del dia anterior
+    // Cas 2: Accions de dies anteriors que encara estiguin pendents
+    // Inclou tant accions normals com les que creuaven mitjanit
+    // Ex: Acció de ahir 23:00-00:00 que no es va executar → missed
     let result_old = sqlx::query(
         r#"
         UPDATE scheduled_actions
@@ -354,7 +357,7 @@ async fn mark_expired_actions_as_missed(pool: &PgPool) -> Result<(), sqlx::Error
 
     if result_old.rows_affected() > 0 {
         tracing::info!(
-            "Marcades {} accions antigues com a 'missed'",
+            "Marcades {} accions de dies anteriors com a 'missed'",
             result_old.rows_affected()
         );
     }
