@@ -1,69 +1,95 @@
 use actix_web::{HttpResponse, ResponseError};
-use std::fmt;
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum AppError {
-    Database(sqlx::Error),
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("Not found: {0}")]
     NotFound(String),
+
+    #[error("Unauthorized: {0}")]
     Unauthorized(String),
+
+    #[error("Bad request: {0}")]
     BadRequest(String),
-    Internal(String),
+
+    #[error("External API error: {0}")]
     ExternalApi(String),
+
+    #[error("Validation error: {field} - {message}")]
+    Validation { field: String, message: String },
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
 }
 
-impl fmt::Display for AppError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Database(e) => write!(f, "Database error: {}", e),
-            Self::NotFound(msg) => write!(f, "Not found: {}", msg),
-            Self::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
-            Self::BadRequest(msg) => write!(f, "Bad request: {}", msg),
-            Self::Internal(msg) => write!(f, "Internal error: {}", msg),
-            Self::ExternalApi(msg) => write!(f, "External API error: {}", msg),
+impl AppError {
+    /// Crea un error de validació per un camp específic
+    pub fn validation(field: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Validation {
+            field: field.into(),
+            message: message.into(),
         }
+    }
+
+    /// Crea un error de recurs no trobat amb context
+    pub fn not_found(resource: impl Into<String>, id: impl std::fmt::Display) -> Self {
+        Self::NotFound(format!("{} with id '{}' not found", resource.into(), id))
     }
 }
 
 impl ResponseError for AppError {
     fn error_response(&self) -> HttpResponse {
-        let (status, message) = match self {
-            Self::Database(_) => (
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Database error".to_string(),
+        use actix_web::http::StatusCode;
+
+        let (status, error_type, message) = match self {
+            Self::Database(e) => {
+                // Log the full error but return generic message to client
+                tracing::error!(error = ?e, "Database error occurred");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "database_error",
+                    "A database error occurred".to_string(),
+                )
+            }
+            Self::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
+            Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "unauthorized", msg.clone()),
+            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
+            Self::ExternalApi(msg) => {
+                tracing::warn!(message = %msg, "External API error");
+                (StatusCode::BAD_GATEWAY, "external_api_error", msg.clone())
+            }
+            Self::Validation { field, message } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_error",
+                format!("{}: {}", field, message),
             ),
-            Self::NotFound(msg) => (actix_web::http::StatusCode::NOT_FOUND, msg.clone()),
-            Self::Unauthorized(msg) => (actix_web::http::StatusCode::UNAUTHORIZED, msg.clone()),
-            Self::BadRequest(msg) => (actix_web::http::StatusCode::BAD_REQUEST, msg.clone()),
-            Self::Internal(msg) => (
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                msg.clone(),
-            ),
-            Self::ExternalApi(msg) => (actix_web::http::StatusCode::BAD_GATEWAY, msg.clone()),
+            Self::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone()),
         };
 
         HttpResponse::build(status).json(serde_json::json!({
-            "error": message
+            "error": {
+                "type": error_type,
+                "message": message
+            }
         }))
     }
 }
 
-impl From<sqlx::Error> for AppError {
-    fn from(e: sqlx::Error) -> Self {
-        tracing::error!("Database error: {:?}", e);
-        Self::Database(e)
-    }
-}
+// Note: From<sqlx::Error> is derived automatically via #[from] attribute
 
 impl From<jsonwebtoken::errors::Error> for AppError {
     fn from(e: jsonwebtoken::errors::Error) -> Self {
-        tracing::error!("JWT error: {:?}", e);
+        tracing::warn!(error = %e, "JWT validation failed");
         Self::Unauthorized(format!("Invalid token: {}", e))
     }
 }
 
 impl From<reqwest::Error> for AppError {
     fn from(e: reqwest::Error) -> Self {
-        tracing::error!("HTTP client error: {:?}", e);
+        tracing::warn!(error = %e, url = ?e.url(), "HTTP request failed");
         Self::ExternalApi(format!("External API error: {}", e))
     }
 }

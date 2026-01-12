@@ -1,4 +1,5 @@
-use actix_web::{get, post, web, HttpRequest, HttpResponse};
+use actix_governor::{Governor, GovernorConfigBuilder};
+use actix_web::{web, HttpRequest, HttpResponse};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -41,15 +42,41 @@ pub struct UserResponse {
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(google_login)
-        .service(refresh_token)
-        .service(get_me);
+    // Rate limiting per endpoints d'autenticació:
+    // - 10 peticions per minut per IP per login/refresh (prevé brute force)
+    // - 60 peticions per minut per /me (més permissiu per operacions normals)
+    let auth_rate_limit = GovernorConfigBuilder::default()
+        .seconds_per_request(6) // 1 petició cada 6 segons = ~10 per minut
+        .burst_size(2)
+        .finish()
+        .expect("Failed to create auth rate limiter config");
+
+    let me_rate_limit = GovernorConfigBuilder::default()
+        .seconds_per_request(1) // 1 petició per segon = 60 per minut
+        .burst_size(10)
+        .finish()
+        .expect("Failed to create me rate limiter config");
+
+    cfg.service(
+        web::resource("/auth/google")
+            .wrap(Governor::new(&auth_rate_limit))
+            .route(web::post().to(google_login_handler)),
+    )
+    .service(
+        web::resource("/auth/refresh")
+            .wrap(Governor::new(&auth_rate_limit))
+            .route(web::post().to(refresh_token_handler)),
+    )
+    .service(
+        web::resource("/auth/me")
+            .wrap(Governor::new(&me_rate_limit))
+            .route(web::get().to(get_me_handler)),
+    );
 }
 
 /// POST /api/auth/google
 /// Login amb Google ID token
-#[post("/auth/google")]
-async fn google_login(
+async fn google_login_handler(
     pool: web::Data<PgPool>,
     config: web::Data<Config>,
     google_auth: web::Data<GoogleAuthService>,
@@ -81,8 +108,7 @@ async fn google_login(
 
 /// POST /api/auth/refresh
 /// Permet refresh de tokens expirats fins a 7 dies després de l'expiració
-#[post("/auth/refresh")]
-async fn refresh_token(
+async fn refresh_token_handler(
     pool: web::Data<PgPool>,
     config: web::Data<Config>,
     req: HttpRequest,
@@ -106,8 +132,7 @@ async fn refresh_token(
 }
 
 /// GET /api/auth/me
-#[get("/auth/me")]
-async fn get_me(
+async fn get_me_handler(
     pool: web::Data<PgPool>,
     config: web::Data<Config>,
     req: HttpRequest,

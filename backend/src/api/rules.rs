@@ -1,5 +1,5 @@
 use actix_web::{delete, get, post, put, web, HttpRequest, HttpResponse};
-use chrono::{Datelike, Local, NaiveTime};
+use chrono::{Local, NaiveTime};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::db::models::{Device, Rule};
 use crate::error::{AppError, AppResult};
 use crate::services::pvpc::PvpcClient;
-use crate::services::scheduler::calculate_optimal_hours;
+use crate::services::scheduler::generate_schedules_for_rule_and_date;
 
 use super::auth::extract_user_from_request;
 
@@ -446,7 +446,7 @@ async fn regenerate_schedules_for_rule(
     // El filtre de temps: None = totes les hores, Some(time) = només hores futures
     let time_filter = if include_past_hours { None } else { Some(current_time) };
 
-    // Generar per avui
+    // Generar per avui (usant la funció compartida del mòdul scheduler)
     match pvpc.get_today_prices().await {
         Ok(prices) => {
             today_available = !prices.prices.is_empty();
@@ -455,7 +455,9 @@ async fn regenerate_schedules_for_rule(
                 today,
                 prices.prices.len()
             );
-            let count = generate_schedules_for_rule_and_date(pool, rule, &prices, today, time_filter).await?;
+            let count = generate_schedules_for_rule_and_date(pool, rule, &prices, today, time_filter)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             if include_past_hours {
                 tracing::info!(
                     "Generats {} schedules per avui (totes les hores del dia)",
@@ -481,7 +483,9 @@ async fn regenerate_schedules_for_rule(
         Ok(prices) => {
             tomorrow_available = !prices.prices.is_empty();
             if tomorrow_available {
-                let count = generate_schedules_for_rule_and_date(pool, rule, &prices, tomorrow, None).await?;
+                let count = generate_schedules_for_rule_and_date(pool, rule, &prices, tomorrow, None)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                 tracing::info!("Generats {} schedules per demà ({})", count, tomorrow);
                 tomorrow_count = count;
                 created_count += count;
@@ -519,85 +523,6 @@ async fn regenerate_schedules_for_rule(
         schedules_created: created_count,
         message,
     })
-}
-
-/// Genera schedules per una regla i una data específica
-async fn generate_schedules_for_rule_and_date(
-    pool: &PgPool,
-    rule: &Rule,
-    prices: &shared::DailyPrices,
-    date: chrono::NaiveDate,
-    min_time: Option<NaiveTime>,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    // Comprovar si el dia de la setmana està inclòs
-    let weekday = date.weekday();
-    let day_bit = match weekday {
-        chrono::Weekday::Mon => 1,
-        chrono::Weekday::Tue => 2,
-        chrono::Weekday::Wed => 4,
-        chrono::Weekday::Thu => 8,
-        chrono::Weekday::Fri => 16,
-        chrono::Weekday::Sat => 32,
-        chrono::Weekday::Sun => 64,
-    };
-
-    if (rule.days_of_week & day_bit) == 0 {
-        return Ok(0);
-    }
-
-    // Calcular les hores òptimes
-    let optimal = calculate_optimal_hours(
-        &prices.prices,
-        rule.max_hours,
-        rule.min_continuous_hours,
-        rule.time_window_start,
-        rule.time_window_end,
-    );
-
-    let mut created_count = 0;
-
-    for hour in &optimal.hours {
-        let start_time = NaiveTime::from_hms_opt(*hour as u32, 0, 0).unwrap();
-
-        // Si hi ha min_time, saltar hores que ja han passat
-        if let Some(min) = min_time {
-            if start_time <= min {
-                continue;
-            }
-        }
-
-        // Per l'hora 23, end_time seria 00:00 que causa problemes de comparació
-        // Usem 23:59:59 per evitar que end_time < start_time
-        let end_time = if *hour == 23 {
-            NaiveTime::from_hms_opt(23, 59, 59).unwrap()
-        } else {
-            NaiveTime::from_hms_opt(*hour as u32 + 1, 0, 0).unwrap()
-        };
-        let price = prices.prices.iter()
-            .find(|p| p.hour == *hour)
-            .map(|p| p.price);
-
-        let result = sqlx::query(
-            r#"
-            INSERT INTO scheduled_actions (rule_id, scheduled_date, start_time, end_time, price_per_kwh, status)
-            VALUES ($1, $2, $3, $4, $5, 'pending')
-            ON CONFLICT (rule_id, scheduled_date, start_time) DO NOTHING
-            "#
-        )
-        .bind(rule.id)
-        .bind(date)
-        .bind(start_time)
-        .bind(end_time)
-        .bind(price)
-        .execute(pool)
-        .await?;
-
-        if result.rows_affected() > 0 {
-            created_count += 1;
-        }
-    }
-
-    Ok(created_count)
 }
 
 /// Cancel·la els schedules pendents d'una regla (quan es desactiva)

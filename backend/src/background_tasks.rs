@@ -1,12 +1,11 @@
-use chrono::{Datelike, Local, NaiveTime, Timelike};
-use shared::DailyPrices;
+use chrono::{Local, Timelike};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
 use crate::db::models::Rule;
 use crate::services::pvpc::PvpcClient;
-use crate::services::scheduler::calculate_optimal_hours;
+use crate::services::scheduler::generate_schedules_for_rules;
 
 /// Hora a la qual es generen els schedules de demà (20:30)
 const SCHEDULE_GENERATION_HOUR: u32 = 20;
@@ -46,13 +45,12 @@ async fn check_and_generate_today_schedules(pool: &PgPool, pvpc: &PvpcClient) {
     let tomorrow = today + chrono::Duration::days(1);
 
     // === Generar schedules per AVUI ===
-    let existing_today: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scheduled_actions WHERE scheduled_date = $1"
-    )
-    .bind(today)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
+    let existing_today: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_actions WHERE scheduled_date = $1")
+            .bind(today)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
 
     if existing_today > 0 {
         tracing::info!(
@@ -61,7 +59,10 @@ async fn check_and_generate_today_schedules(pool: &PgPool, pvpc: &PvpcClient) {
             today
         );
     } else {
-        tracing::info!("No hi ha schedules per avui ({}), intentant generar-los...", today);
+        tracing::info!(
+            "No hi ha schedules per avui ({}), intentant generar-los...",
+            today
+        );
         match generate_schedules_for_date(pool, pvpc, today).await {
             Ok(count) => {
                 tracing::info!("Generats {} schedules per avui ({})", count, today);
@@ -80,13 +81,12 @@ async fn check_and_generate_today_schedules(pool: &PgPool, pvpc: &PvpcClient) {
         || (now.hour() == SCHEDULE_GENERATION_HOUR && now.minute() >= SCHEDULE_GENERATION_MINUTE);
 
     if is_after_schedule_time {
-        let existing_tomorrow: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM scheduled_actions WHERE scheduled_date = $1"
-        )
-        .bind(tomorrow)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
+        let existing_tomorrow: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_actions WHERE scheduled_date = $1")
+                .bind(tomorrow)
+                .fetch_one(pool)
+                .await
+                .unwrap_or(0);
 
         if existing_tomorrow > 0 {
             tracing::info!(
@@ -139,23 +139,17 @@ async fn run_daily_scheduler(pool: Arc<PgPool>, pvpc: Arc<PvpcClient>) {
         let already_generated_today = last_generation_date == Some(tomorrow);
 
         // Comprovar si cal reintentar
-        let should_retry = retry_pending && last_retry.map_or(true, |last| {
-            now.signed_duration_since(last).num_minutes() >= RETRY_INTERVAL_MINUTES as i64
-        });
+        let should_retry = retry_pending
+            && last_retry.map_or(true, |last| {
+                now.signed_duration_since(last).num_minutes() >= RETRY_INTERVAL_MINUTES as i64
+            });
 
         if (is_schedule_time && !already_generated_today) || should_retry {
-            tracing::info!(
-                "Generant schedules per demà ({})...",
-                tomorrow
-            );
+            tracing::info!("Generant schedules per demà ({})...", tomorrow);
 
             match generate_schedules_for_date(&pool, &pvpc, tomorrow).await {
                 Ok(count) => {
-                    tracing::info!(
-                        "Generats {} schedules per demà ({})",
-                        count,
-                        tomorrow
-                    );
+                    tracing::info!("Generats {} schedules per demà ({})", count, tomorrow);
                     last_generation_date = Some(tomorrow);
                     retry_pending = false;
                     last_retry = None;
@@ -174,7 +168,7 @@ async fn run_daily_scheduler(pool: Arc<PgPool>, pvpc: Arc<PvpcClient>) {
     }
 }
 
-/// Genera schedules per una data específica
+/// Genera schedules per una data específica utilitzant la funció compartida
 async fn generate_schedules_for_date(
     pool: &PgPool,
     pvpc: &PvpcClient,
@@ -193,99 +187,28 @@ async fn generate_schedules_for_date(
 
     let prices = prices.map_err(|e| format!("Error obtenint preus: {:?}", e))?;
 
-    // Utilitzar la funció existent per generar schedules
-    // Però primer hem de modificar-la per acceptar una data i preus
-    let count = generate_schedule_with_prices(pool, &prices, date)
-        .await
-        .map_err(|e| format!("Error generant schedules: {:?}", e))?;
-
-    Ok(count)
-}
-
-/// Genera schedules per una data amb preus ja obtinguts
-async fn generate_schedule_with_prices(
-    pool: &PgPool,
-    prices: &DailyPrices,
-    date: chrono::NaiveDate,
-) -> Result<usize, sqlx::Error> {
-
     // Obtenir totes les regles actives
-    let rules = sqlx::query_as::<_, Rule>(
-        "SELECT * FROM rules WHERE is_enabled = true"
-    )
-    .fetch_all(pool)
-    .await?;
+    let rules = sqlx::query_as::<_, Rule>("SELECT * FROM rules WHERE is_enabled = true")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("Error obtenint regles: {:?}", e))?;
 
-    let mut created_count = 0;
     let rules_count = rules.len();
 
-    for rule in rules {
-        // Comprovar si el dia de la setmana està inclòs
-        let weekday = date.weekday();
-        let day_bit = match weekday {
-            chrono::Weekday::Mon => 1,
-            chrono::Weekday::Tue => 2,
-            chrono::Weekday::Wed => 4,
-            chrono::Weekday::Thu => 8,
-            chrono::Weekday::Fri => 16,
-            chrono::Weekday::Sat => 32,
-            chrono::Weekday::Sun => 64,
-        };
-
-        if (rule.days_of_week & day_bit) == 0 {
-            continue; // Aquesta regla no s'aplica aquest dia
-        }
-
-        // Calcular les hores òptimes
-        let optimal = calculate_optimal_hours(
-            &prices.prices,
-            rule.max_hours,
-            rule.min_continuous_hours,
-            rule.time_window_start,
-            rule.time_window_end,
-        );
-
-        // Crear scheduled_actions per cada hora
-        for hour in &optimal.hours {
-            let start_time = NaiveTime::from_hms_opt(*hour as u32, 0, 0).unwrap();
-            // end_time és sempre l'hora següent (00:00 per l'hora 23)
-            // Quan start_time > end_time, significa que l'acció creua mitjanit
-            // L'Android i el backend han de tractar aquest cas especialment
-            let end_time = NaiveTime::from_hms_opt(((*hour + 1) % 24) as u32, 0, 0).unwrap();
-
-            let price = prices.prices.iter()
-                .find(|p| p.hour == *hour)
-                .map(|p| p.price);
-
-            let result = sqlx::query(
-                r#"
-                INSERT INTO scheduled_actions (rule_id, scheduled_date, start_time, end_time, price_per_kwh, status)
-                VALUES ($1, $2, $3, $4, $5, 'pending')
-                ON CONFLICT (rule_id, scheduled_date, start_time) DO NOTHING
-                "#
-            )
-            .bind(rule.id)
-            .bind(date)
-            .bind(start_time)
-            .bind(end_time)
-            .bind(price)
-            .execute(pool)
-            .await?;
-
-            if result.rows_affected() > 0 {
-                created_count += 1;
-            }
-        }
-    }
+    // Utilitzar la funció compartida per generar schedules
+    // None = generar per totes les hores (no només futures)
+    let count = generate_schedules_for_rules(pool, &rules, &prices, date, None)
+        .await
+        .map_err(|e| format!("Error generant schedules: {:?}", e))?;
 
     tracing::info!(
         "Processades {} regles, creats {} scheduled_actions per {}",
         rules_count,
-        created_count,
+        count,
         date
     );
 
-    Ok(created_count)
+    Ok(count)
 }
 
 /// Comprova cada minut si hi ha accions pendents que ja han expirat i les marca com 'missed'
@@ -324,7 +247,7 @@ async fn mark_expired_actions_as_missed(pool: &PgPool) -> Result<(), sqlx::Error
           AND scheduled_date = $1
           AND end_time > start_time
           AND end_time <= $2
-        "#
+        "#,
     )
     .bind(today)
     .bind(current_time)
@@ -349,7 +272,7 @@ async fn mark_expired_actions_as_missed(pool: &PgPool) -> Result<(), sqlx::Error
         SET status = 'missed'
         WHERE status = 'pending'
           AND scheduled_date < $1
-        "#
+        "#,
     )
     .bind(today)
     .execute(pool)

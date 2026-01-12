@@ -200,13 +200,16 @@ async fn generate_schedules_for_rules(
 
         // Crear scheduled_actions per cada hora
         for hour in &optimal.hours {
-            let start_time = NaiveTime::from_hms_opt(*hour as u32, 0, 0).unwrap();
+            let start_time = NaiveTime::from_hms_opt(*hour as u32, 0, 0)
+                .expect("Hour value should be valid (0-23)");
             // Per l'hora 23, end_time seria 00:00 que causa problemes de comparació
             // Usem 23:59:59 per evitar que end_time < start_time
             let end_time = if *hour == 23 {
-                NaiveTime::from_hms_opt(23, 59, 59).unwrap()
+                NaiveTime::from_hms_opt(23, 59, 59)
+                    .expect("23:59:59 should always be a valid time")
             } else {
-                NaiveTime::from_hms_opt(*hour as u32 + 1, 0, 0).unwrap()
+                NaiveTime::from_hms_opt(*hour as u32 + 1, 0, 0)
+                    .expect("End hour should be valid (1-24 becomes 1-23 + hour 0)")
             };
 
             let price = prices.prices.iter()

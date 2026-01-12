@@ -20,9 +20,18 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
+        // Validar JWT_SECRET
+        let jwt_secret = env::var("JWT_SECRET")?;
+        if jwt_secret.len() < 32 {
+            panic!(
+                "JWT_SECRET must be at least 32 characters for security. Current length: {}",
+                jwt_secret.len()
+            );
+        }
+
         Ok(Self {
             database_url: env::var("DATABASE_URL")?,
-            jwt_secret: env::var("JWT_SECRET")?,
+            jwt_secret,
             google_client_id: env::var("GOOGLE_CLIENT_ID")?,
             server_host: env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             server_port: env::var("SERVER_PORT")

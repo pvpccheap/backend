@@ -47,7 +47,11 @@ impl From<DailyPrices> for PricesWithStats {
         let avg_price = prices.prices.iter().map(|p| p.price).sum::<f64>() / prices.prices.len() as f64;
 
         let mut sorted_by_price = prices.prices.clone();
-        sorted_by_price.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
+        sorted_by_price.sort_by(|a, b| {
+            a.price
+                .partial_cmp(&b.price)
+                .expect("Price comparison failed: NaN values not allowed in PVPC prices")
+        });
 
         let cheapest_hours: Vec<u8> = sorted_by_price.iter().take(6).map(|p| p.hour).collect();
         let most_expensive_hours: Vec<u8> = sorted_by_price.iter().rev().take(6).map(|p| p.hour).collect();

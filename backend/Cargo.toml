@@ -45,3 +45,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-actix-web = "0.7.20"
+
+# Rate limiting
+actix-governor = "0.8"
+governor = "0.8"
